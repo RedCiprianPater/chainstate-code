@@ -1,0 +1,16 @@
+{
+  "name": "chainstate-code",
+  "version": "1.1.0",
+  "description": "CHAINSTATE CODE — Ornith-1.0 × CHAINSTATE Integration",
+  "main": "ornith_chainstate_adapter.py",
+  "scripts": {
+    "start": "python ornith_chainstate_adapter.py",
+    "dev": "uvicorn ornith_chainstate_adapter:app --reload --port 8080",
+    "example:cognitive": "python examples/cognitive_transaction.py",
+    "example:swarm": "python examples/swarm_inference.py"
+  },
+  "python": {
+    "requirements": "requirements-ornith.txt"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+# Ornith-CHAINSTATE adapter dependencies
+# NOTE: torch + transformers only needed for LOCAL Ornith inference.
+# If you proxy to an OpenAI-compatible endpoint (ORNITH_BASE_URL), you can
+# skip them and the adapter falls back to API mode automatically.
+
+fastapi>=0.104.0,<1.0
+uvicorn>=0.24.0,<1.0
+httpx>=0.25.0,<1.0
+pydantic>=2.5.0,<3.0
+numpy>=1.24.0,<3.0
+
+# Local inference (optional — comment out for API-only mode)
+torch>=2.1.0
+transformers>=4.45.0,<5.0
