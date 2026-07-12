@@ -1,4 +1,4 @@
-# Ornith-CHAINSTATE adapter dependencies
+# Ornith-CHAINSTATE adapter dependencies · v1.2.0
 # NOTE: torch + transformers only needed for LOCAL Ornith inference.
 # If you proxy to an OpenAI-compatible endpoint (ORNITH_BASE_URL), you can
 # skip them and the adapter falls back to API mode automatically.
@@ -12,3 +12,11 @@ numpy>=1.24.0,<3.0
 # Local inference (optional — comment out for API-only mode)
 torch>=2.1.0
 transformers>=4.45.0,<5.0
+
+# NOTE for v1.2.0 ASI-Evolve integration:
+# ASI-Evolve is installed as a sibling repo, NOT as a Python package.
+# Clone it once on the Render instance during build:
+#   git clone https://github.com/GAIR-NLP/ASI-Evolve /opt/ASI-Evolve
+#   cd /opt/ASI-Evolve && pip install -r requirements.txt
+# Then set ASI_EVOLVE_ROOT=/opt/ASI-Evolve in Render env vars.
+# The adapter reads its SQLite database directly (read-only) via /v1/evolve/*.

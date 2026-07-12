@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """
-Ornith-1.0 × CHAINSTATE Integration Adapter
-Main bridge between the Ornith coding agent and the CHAINSTATE symbolic blockchain.
+Ornith-1.0 × CHAINSTATE Integration Adapter · v1.2.0
 
-Modes:
+Extends v1.1.0 with ASI-Evolve integration endpoints:
+  POST /v1/evolve/start    start an ASI-Evolve run against chainstate_evolve/
+  POST /v1/evolve/stop     halt the current run
+  GET  /v1/evolve/status   current round, best score, IDLE/RUNNING, PID
+  GET  /v1/evolve/history  every trial with score, motivation, lesson
+  GET  /v1/evolve/best     the top-scoring NWO-ASM program found so far
+
+Owner-controlled: start/stop require X-Owner-Token header matching
+$EVOLVE_OWNER_TOKEN. Read endpoints are public (LIVE dashboard).
+
+Modes (Ornith side, unchanged):
   LOCAL  — torch+transformers installed → loads ORNITH_MODEL in-process
   API    — no torch, or model load fails → proxies to ORNITH_BASE_URL
-           (any OpenAI-compatible endpoint: vLLM, TGI, Together, etc.)
-
-Endpoints:
-  POST /v1/generate      code + 65,536-d symbolic embedding
-  POST /v1/query         cognitive transaction → CHAINSTATE worker
-  POST /v1/consensus     swarm consensus participation
-  POST /v1/asm/compile   NWO-ASM IR generation
-  POST /v1/embed         symbolic embedding only
-  GET  /status           adapter + worker health
 """
 
 import os
 import json
 import time
+import signal
+import subprocess
+import sqlite3
+from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
 import numpy as np
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Optional heavy deps — adapter still works API-only without them ──
@@ -41,6 +45,14 @@ ORNITH_MODEL      = os.getenv("ORNITH_MODEL", "deepreinforce-ai/Ornith-1.0-9B")
 ORNITH_BASE_URL   = os.getenv("ORNITH_BASE_URL", "http://localhost:8000/v1")
 ORNITH_API_KEY    = os.getenv("ORNITH_API_KEY", "EMPTY")
 CHAINSTATE_WORKER = os.getenv("CHAINSTATE_WORKER", "https://chainstate-worker.ciprianpater.workers.dev")
+
+# ASI-Evolve integration
+EVOLVE_ROOT         = Path(os.getenv("EVOLVE_ROOT", "./chainstate_evolve")).resolve()
+EVOLVE_DB_PATH      = EVOLVE_ROOT / "database" / "experiments.sqlite"
+EVOLVE_PIDFILE      = EVOLVE_ROOT / "evolve.pid"
+EVOLVE_LOG          = EVOLVE_ROOT / "evolve.log"
+EVOLVE_OWNER_TOKEN  = os.getenv("EVOLVE_OWNER_TOKEN", "")  # required for start/stop
+EVOLVE_STEPS_MAX    = int(os.getenv("EVOLVE_STEPS_MAX", "50"))  # hard cap per run
 
 # CHAINSTATE canonical constants (Base mainnet 8453)
 CHAIN_ID   = 8453
@@ -60,13 +72,16 @@ SUBSPACES = [
 ]
 USE_DIMS = 65536
 
-app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.1.0")
+# Ecosystem owner — stamped in every response
+ECOSYSTEM_OWNER = "Ciprian Florin Pater"
+
+app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Owner-Token"],
 )
 
 
@@ -126,7 +141,6 @@ class OrnithChainstateBridge:
             reasoning, answer = self._parse_thinking(content)
             return {"reasoning": reasoning, "code": answer, "mode": "local"}
 
-        # API mode
         response = await self.client.post(
             f"{ORNITH_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ORNITH_API_KEY}"},
@@ -147,7 +161,6 @@ class OrnithChainstateBridge:
 
     @staticmethod
     def _parse_thinking(text: str) -> tuple:
-        """Parse <think> blocks from Ornith output."""
         if "</think>" in text:
             reasoning, answer = text.split("</think>", 1)
             reasoning = reasoning.replace("<think>", "").strip()
@@ -158,12 +171,7 @@ class OrnithChainstateBridge:
 
     @staticmethod
     def generate_symbolic_embedding(text: str) -> List[float]:
-        """Generate the 65,536-d Universal Semiotic Embedding.
-
-        Simplified deterministic scorer — in production, swap for the full
-        CHAINSTATE embedding model. Subspace activation is driven by actual
-        codepoint membership so the dominant_subspace matches worker routing.
-        """
+        """Generate the 65,536-d Universal Semiotic Embedding."""
         rng = np.random.default_rng(abs(hash(text)) % (2**32))
         embedding = np.zeros(USE_DIMS, dtype=np.float32)
 
@@ -180,14 +188,12 @@ class OrnithChainstateBridge:
                 start, dims = starts[name]
                 embedding[start:start+dims] = rng.standard_normal(dims) * 0.5 + 0.5
 
-        # lang — any letter content activates a deterministic slice
         if any(c.isalpha() for c in text):
             start, dims = starts["lang"]
             slice_len = min(1024, dims)
             offset = abs(hash(text)) % (dims - slice_len)
             embedding[start+offset:start+offset+slice_len] = rng.standard_normal(slice_len) * 0.4
 
-        # emo — non-ASCII beyond the pools above
         if any(ord(c) > 0x1F000 for c in text):
             start, dims = starts["emo"]
             embedding[start:start+dims] = rng.standard_normal(dims) * 0.3
@@ -198,7 +204,6 @@ class OrnithChainstateBridge:
         return embedding.tolist()
 
     async def submit_to_chainstate(self, tx: SymbolicTransaction) -> Dict:
-        """Submit transaction to the CHAINSTATE worker."""
         response = await self.client.post(
             f"{CHAINSTATE_WORKER}/query",
             json={
@@ -212,9 +217,9 @@ class OrnithChainstateBridge:
 
     @staticmethod
     async def compile_to_asm(code: str, target: str = "gpu") -> Dict:
-        """Compile code to NWO-ASM Process-Matrix IR."""
         asm_ir = f"""; NWO-ASM IR — generated by Ornith-CHAINSTATE adapter
 ; Target: {target}
+; Owner: {ECOSYSTEM_OWNER}
 ; Timestamp: {time.time():.0f}
 
 .PROCESS matrix_compute
@@ -240,11 +245,54 @@ class OrnithChainstateBridge:
 
 bridge = OrnithChainstateBridge()
 
-# ── API Endpoints ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# ASI-Evolve integration helpers
+# ══════════════════════════════════════════════════════════════════
+
+def _require_owner(token: Optional[str]):
+    """Verify the caller holds the owner token before mutating evolve state."""
+    if not EVOLVE_OWNER_TOKEN:
+        raise HTTPException(500, "EVOLVE_OWNER_TOKEN not configured on the server")
+    if token != EVOLVE_OWNER_TOKEN:
+        raise HTTPException(403, "invalid owner token")
+
+
+def _evolve_is_running() -> Optional[int]:
+    """Return PID if the ASI-Evolve loop is running, else None."""
+    if not EVOLVE_PIDFILE.exists():
+        return None
+    try:
+        pid = int(EVOLVE_PIDFILE.read_text().strip())
+        os.kill(pid, 0)  # signal 0 = existence check
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        try:
+            EVOLVE_PIDFILE.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+
+
+def _read_evolve_db(query: str, params: tuple = ()) -> List[Dict]:
+    """Read from ASI-Evolve's SQLite experiment database (read-only)."""
+    if not EVOLVE_DB_PATH.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{EVOLVE_DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+        conn.close()
+        return rows
+    except sqlite3.Error as e:
+        return [{"error": str(e)[:200]}]
+
+
+# ══════════════════════════════════════════════════════════════════
+# Existing endpoints (v1.1.0) — unchanged
+# ══════════════════════════════════════════════════════════════════
 
 @app.post("/v1/generate")
 async def generate_endpoint(request: Dict):
-    """Generate code + symbolic embedding."""
     prompt = request.get("prompt", "")
     temperature = float(request.get("temperature", 0.6))
     result = await bridge.generate_code(prompt, temperature)
@@ -260,7 +308,6 @@ async def generate_endpoint(request: Dict):
 
 @app.post("/v1/embed")
 async def embed_endpoint(request: Dict):
-    """Symbolic embedding only — no code generation."""
     text = request.get("text", "")
     return {
         "symbolic_embedding": bridge.generate_symbolic_embedding(text),
@@ -271,7 +318,6 @@ async def embed_endpoint(request: Dict):
 
 @app.post("/v1/query")
 async def query_endpoint(request: Dict):
-    """Query CHAINSTATE with Ornith-enhanced context."""
     query = request.get("query", "")
     swarm_size = int(request.get("swarmSize", 20))
     consensus_depth = int(request.get("consensusDepth", 3))
@@ -291,7 +337,6 @@ async def query_endpoint(request: Dict):
 
 @app.post("/v1/consensus")
 async def consensus_endpoint(request: Dict):
-    """Submit an Ornith state to swarm consensus."""
     state = request.get("state", [])
     reputation = float(request.get("reputation", 1.0))
     response = await bridge.client.post(
@@ -303,29 +348,178 @@ async def consensus_endpoint(request: Dict):
 
 @app.post("/v1/asm/compile")
 async def asm_compile_endpoint(request: Dict):
-    """Compile code to NWO-ASM IR."""
     code = request.get("code", "")
     target = request.get("target", "gpu")
     return await bridge.compile_to_asm(code, target)
 
 
+# ══════════════════════════════════════════════════════════════════
+# NEW · v1.2.0 · ASI-Evolve endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/v1/evolve/start")
+async def evolve_start(
+    request: Dict,
+    x_owner_token: Optional[str] = Header(None),
+):
+    """Start an ASI-Evolve run against chainstate_evolve/.
+
+    Owner-authenticated. Steps hard-capped at EVOLVE_STEPS_MAX.
+    Returns immediately with the PID; use /v1/evolve/status to poll.
+    """
+    _require_owner(x_owner_token)
+
+    existing = _evolve_is_running()
+    if existing:
+        raise HTTPException(409, f"evolve loop already running (pid {existing})")
+
+    requested = int(request.get("steps", 20))
+    steps = max(1, min(requested, EVOLVE_STEPS_MAX))
+    sample_n = max(1, min(int(request.get("sample_n", 3)), 10))
+
+    if not EVOLVE_ROOT.exists():
+        raise HTTPException(500, f"EVOLVE_ROOT does not exist: {EVOLVE_ROOT}")
+
+    eval_script = EVOLVE_ROOT / "eval.sh"
+    if not eval_script.exists():
+        raise HTTPException(500, f"missing eval.sh at {eval_script}")
+
+    log_fp = open(EVOLVE_LOG, "a")
+    log_fp.write(f"\n═══ RUN START · {time.strftime('%Y-%m-%d %H:%M:%S')} · owner: {ECOSYSTEM_OWNER} ═══\n")
+    log_fp.flush()
+
+    proc = subprocess.Popen(
+        [
+            "python", "main.py",
+            "--experiment", "chainstate_evolve",
+            "--steps", str(steps),
+            "--sample-n", str(sample_n),
+            "--eval-script", str(eval_script),
+        ],
+        cwd=os.getenv("ASI_EVOLVE_ROOT", "./ASI-Evolve"),
+        stdout=log_fp, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    EVOLVE_PIDFILE.write_text(str(proc.pid))
+    return {
+        "started": True,
+        "pid": proc.pid,
+        "steps": steps,
+        "sample_n": sample_n,
+        "steps_cap": EVOLVE_STEPS_MAX,
+        "owner": ECOSYSTEM_OWNER,
+        "note": "Hard step cap enforced. Stop anytime via POST /v1/evolve/stop.",
+    }
+
+
+@app.post("/v1/evolve/stop")
+async def evolve_stop(x_owner_token: Optional[str] = Header(None)):
+    """Halt the current ASI-Evolve run (SIGTERM to the process group)."""
+    _require_owner(x_owner_token)
+    pid = _evolve_is_running()
+    if not pid:
+        return {"stopped": False, "reason": "no evolve loop running"}
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        time.sleep(0.5)
+        if _evolve_is_running():
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError) as e:
+        return {"stopped": False, "reason": str(e)}
+    try:
+        EVOLVE_PIDFILE.unlink()
+    except FileNotFoundError:
+        pass
+    return {"stopped": True, "pid": pid, "owner": ECOSYSTEM_OWNER}
+
+
+@app.get("/v1/evolve/status")
+async def evolve_status():
+    """Public read-only status. Never mutates state."""
+    pid = _evolve_is_running()
+    state = "RUNNING" if pid else "IDLE"
+
+    # Round + best-score summary from the experiment database
+    rounds = _read_evolve_db(
+        "SELECT COUNT(*) AS n, MAX(score) AS best_score FROM nodes"
+    )
+    latest = _read_evolve_db(
+        "SELECT id, score, motivation, lesson, created_at "
+        "FROM nodes ORDER BY id DESC LIMIT 1"
+    )
+
+    round_count = 0
+    best_score = None
+    if rounds and "n" in rounds[0]:
+        round_count = rounds[0].get("n") or 0
+        best_score = rounds[0].get("best_score")
+
+    return {
+        "state": state,
+        "pid": pid,
+        "rounds_completed": round_count,
+        "best_score_so_far": best_score,
+        "latest_trial": latest[0] if latest else None,
+        "steps_cap_per_run": EVOLVE_STEPS_MAX,
+        "owner": ECOSYSTEM_OWNER,
+        "experiment": "chainstate_evolve",
+        "objective": "maximize consensus confidence · minimize gas · minimize rounds-to-converge",
+        "evolve_root": str(EVOLVE_ROOT),
+        "db_present": EVOLVE_DB_PATH.exists(),
+    }
+
+
+@app.get("/v1/evolve/history")
+async def evolve_history(limit: int = 50):
+    """Every trial the loop has run, newest first."""
+    limit = max(1, min(limit, 200))
+    rows = _read_evolve_db(
+        "SELECT id, parent_id, score, motivation, lesson, created_at "
+        "FROM nodes ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    return {
+        "count": len(rows),
+        "trials": rows,
+        "owner": ECOSYSTEM_OWNER,
+    }
+
+
+@app.get("/v1/evolve/best")
+async def evolve_best():
+    """The top-scoring NWO-ASM program discovered so far."""
+    rows = _read_evolve_db(
+        "SELECT id, score, code, motivation, lesson, created_at "
+        "FROM nodes ORDER BY score DESC NULLS LAST LIMIT 1"
+    )
+    if not rows:
+        return {"present": False, "note": "no trials completed yet"}
+    return {"present": True, "best": rows[0], "owner": ECOSYSTEM_OWNER}
+
+
+# ══════════════════════════════════════════════════════════════════
+
 @app.get("/status")
 async def status_endpoint():
-    """Adapter + upstream worker health."""
+    """Adapter + upstream worker health, plus evolve state summary."""
     worker = None
     try:
         r = await bridge.client.get(f"{CHAINSTATE_WORKER}/status", timeout=10.0)
         worker = r.json()
     except Exception as e:
         worker = {"error": str(e)[:120]}
+
+    evolve_pid = _evolve_is_running()
+
     return {
         "status": "healthy",
-        "adapter_version": "1.1.0",
+        "adapter_version": "1.2.0",
         "ornith_model": ORNITH_MODEL,
         "mode": "local" if bridge.model is not None else "api",
         "torch_available": _TORCH_OK,
         "chainstate_worker": CHAINSTATE_WORKER,
         "chain_id": CHAIN_ID,
+        "owner": ECOSYSTEM_OWNER,
         "contracts": {
             "state": STATE_TOKEN,
             "usdc": USDC_TOKEN,
@@ -333,9 +527,16 @@ async def status_endpoint():
             "treasury": TREASURY,
         },
         "worker_status": worker,
+        "evolve": {
+            "state": "RUNNING" if evolve_pid else "IDLE",
+            "pid": evolve_pid,
+            "root": str(EVOLVE_ROOT),
+            "db_present": EVOLVE_DB_PATH.exists(),
+            "steps_cap_per_run": EVOLVE_STEPS_MAX,
+        },
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
