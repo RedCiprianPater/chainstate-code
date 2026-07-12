@@ -32,12 +32,21 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
-# ── Optional heavy deps — adapter still works API-only without them ──
-try:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    _TORCH_OK = True
-except ImportError:
+# ── Optional heavy deps — adapter defaults to API-only mode ──────────
+# On free-tier hosts (Render 512MB), importing torch alone eats 200-400MB
+# and loading a 9B model needs ~18GB. So we ONLY try to import torch when
+# the operator explicitly opts in via ORNITH_MODE=local. Default is API mode:
+# every code-gen request proxies to ORNITH_BASE_URL (HF Router, vLLM, etc).
+_ORNITH_MODE = os.getenv("ORNITH_MODE", "api").strip().lower()
+if _ORNITH_MODE == "local":
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        _TORCH_OK = True
+    except ImportError:
+        _TORCH_OK = False
+        print("⚠ ORNITH_MODE=local but torch/transformers not installed — falling back to API mode")
+else:
     _TORCH_OK = False
 
 # ── Configuration ────────────────────────────────────────────────────
@@ -75,7 +84,7 @@ USE_DIMS = 65536
 # Ecosystem owner — stamped in every response
 ECOSYSTEM_OWNER = "Ciprian Florin Pater"
 
-app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.2.0")
+app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.2.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -513,7 +522,7 @@ async def status_endpoint():
 
     return {
         "status": "healthy",
-        "adapter_version": "1.2.0",
+        "adapter_version": "1.2.1",
         "ornith_model": ORNITH_MODEL,
         "mode": "local" if bridge.model is not None else "api",
         "torch_available": _TORCH_OK,
