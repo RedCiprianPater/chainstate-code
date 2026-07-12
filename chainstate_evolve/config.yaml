@@ -1,0 +1,44 @@
+# CHAINSTATE Evolve experiment config
+# Owner: Ciprian Florin Pater
+# Ecosystem: CHAINSTATE · Base mainnet 8453
+#
+# Overrides the ASI-Evolve repo-root config.yaml for this experiment only.
+# See ASI-Evolve README for the full configuration reference.
+
+api:
+  # Uses whatever LLM is configured in the repo-root config.yaml
+  # (env: OPENAI_API_KEY or LiteLLM-compatible provider).
+  # Ornith is preferred if reachable; otherwise fall back to the default.
+  timeout: 120
+
+pipeline:
+  # How many prior trials to show the Researcher when it proposes a new candidate.
+  # 3 balances exploration and grounded refinement for this problem size.
+  sample_n: 3
+  parallel:
+    # A single worker is safest for a search that hits the real CHAINSTATE
+    # worker on every trial — parallel workers would multiply gas.
+    num_workers: 1
+
+database:
+  sampling:
+    # UCB1 favors under-explored high-scoring lineages, which suits a
+    # combinatorial search where local optima are common.
+    algorithm: ucb1
+    exploration_weight: 1.4
+
+cognition:
+  retrieval:
+    # Show the Researcher the top-3 most relevant cognition items per round.
+    # The store has 10 items; retrieval keeps the prompt focused.
+    top_k: 3
+
+experiment:
+  name: chainstate_evolve
+  owner: Ciprian Florin Pater
+  ecosystem: CHAINSTATE
+  chain: base-mainnet-8453
+  objective: >
+    Maximize CHAINSTATE consensus confidence, minimize gas, minimize
+    rounds-to-converge, over valid NWO-ASM programs drawn from the 64k
+    symbol space.
