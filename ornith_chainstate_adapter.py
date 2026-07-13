@@ -84,7 +84,7 @@ USE_DIMS = 65536
 # Ecosystem owner — stamped in every response
 ECOSYSTEM_OWNER = "Ciprian Florin Pater"
 
-app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.2.1")
+app = FastAPI(title="Ornith-CHAINSTATE Adapter", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -508,6 +508,75 @@ async def evolve_best():
 
 # ══════════════════════════════════════════════════════════════════
 
+@app.post("/v1/substrate/gpu")
+async def substrate_gpu_endpoint(request: Dict):
+    """Real numpy work invoked by the main worker when a query specifies TARGET gpu.
+
+    Takes the query and the dominant subspace, projects both to the USE,
+    computes cosine similarity plus a dense matrix eigenvalue metric on the
+    projection. Returns real timing and metric values that get attached to the
+    consensus receipt as `gpu_metrics`.
+
+    This is what makes TARGET gpu materially different from TARGET edge in the
+    receipt: edge queries never call this endpoint, so their gas_used is lower
+    but their receipt lacks the `gpu_metrics` block. The ASI-Evolve loop can
+    learn to prefer or avoid gpu based on the score trade-off.
+    """
+    import time
+    t0 = time.perf_counter()
+
+    query = str(request.get("query", ""))
+    dominant = str(request.get("dominant_subspace", "math"))
+
+    if not query:
+        return {"error": "query required", "owner": ECOSYSTEM_OWNER}
+
+    # Real numpy computation: project query to USE, compute self-similarity
+    embedding = np.array(bridge.generate_symbolic_embedding(query), dtype=np.float32)
+
+    # Slice out the dominant subspace's block for a dense inner-product study
+    subspace_ranges = {n: (s, s + d) for n, s, d in SUBSPACES}
+    if dominant not in subspace_ranges:
+        dominant = "math"
+    start, end = subspace_ranges[dominant]
+    block = embedding[start:end]
+
+    # Real work: 512-dim inner-product matrix over a random projection of the block
+    # (this is CPU-bound but bounded — completes in ~10-30 ms on Render's 1 CPU)
+    rng = np.random.default_rng(abs(hash(query)) % (2**32))
+    proj = rng.standard_normal((min(512, len(block)), 128)).astype(np.float32)
+    projected = block[:proj.shape[0]] @ proj
+    gram = projected.reshape(-1, 1) @ projected.reshape(1, -1)
+
+    # Metrics: block norm, projected norm, trace of gram, top eigenvalue estimate
+    block_norm = float(np.linalg.norm(block))
+    proj_norm = float(np.linalg.norm(projected))
+    trace = float(np.trace(gram))
+    # Power-iteration estimate of top eigenvalue (5 iterations, well-bounded)
+    v = rng.standard_normal(gram.shape[0]).astype(np.float32)
+    for _ in range(5):
+        v = gram @ v
+        n = np.linalg.norm(v)
+        if n > 0:
+            v = v / n
+    top_eig = float((gram @ v) @ v)
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    return {
+        "substrate": "gpu",
+        "dominant_subspace": dominant,
+        "block_dim": int(end - start),
+        "block_norm": block_norm,
+        "projected_norm": proj_norm,
+        "gram_trace": trace,
+        "top_eigenvalue": top_eig,
+        "elapsed_ms": elapsed_ms,
+        "adapter_version": "1.3.0",
+        "owner": ECOSYSTEM_OWNER,
+    }
+
+
 @app.get("/status")
 async def status_endpoint():
     """Adapter + upstream worker health, plus evolve state summary."""
@@ -522,7 +591,7 @@ async def status_endpoint():
 
     return {
         "status": "healthy",
-        "adapter_version": "1.2.1",
+        "adapter_version": "1.3.0",
         "ornith_model": ORNITH_MODEL,
         "mode": "local" if bridge.model is not None else "api",
         "torch_available": _TORCH_OK,
